@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"io/ioutil"
+	"strings"
 )
 
 // PNG looks like:
@@ -23,6 +23,22 @@ type pngChunk struct {
 	data      []byte
 	crc       uint32
 	offset    int64
+}
+
+func (chunk *pngChunk) marshalData(buff *bytes.Buffer) error {
+	if err := binary.Write(buff, binary.BigEndian, chunk.size); err != nil {
+		return fmt.Errorf("error writing chunk size to buffer: %v", err)
+	}
+	if err := binary.Write(buff, binary.BigEndian, chunk.chunkType); err != nil {
+		return fmt.Errorf("error writing chunk type '%s' to buffer: %v", string(chunk.chunkType), err)
+	}
+	if err := binary.Write(buff, binary.BigEndian, chunk.data); err != nil {
+		return fmt.Errorf("error writing chunk data to buffer: %v", err)
+	}
+	if err := binary.Write(buff, binary.BigEndian, chunk.crc); err != nil {
+		return fmt.Errorf("error writing chunk CRC to buffer: %v", err)
+	}
+	return nil
 }
 
 // confirmPng confirms that a file is a png. Note this advances the stream reader
@@ -76,6 +92,7 @@ func loadChunk(b *bytes.Reader) (*pngChunk, error) {
 	return &chunk, nil
 }
 
+// calculateCrc calculates the cyclic redundancy check
 func calculateCrc(chunkType, data []byte) (uint32, error) {
 	var buffer bytes.Buffer
 	if err := binary.Write(&buffer, binary.BigEndian, chunkType); err != nil {
@@ -87,7 +104,11 @@ func calculateCrc(chunkType, data []byte) (uint32, error) {
 	return crc32.ChecksumIEEE(buffer.Bytes()), nil
 }
 
+// loadChunks parses the binary data into the pngChunk type.
 func loadChunks(b *bytes.Reader) ([]*pngChunk, error) {
+	if n, _ := b.Seek(0, 1); n != 8 {
+		return nil, fmt.Errorf("stream must be at the first chunk after the initial 8 size bytes")
+	}
 	var chunks []*pngChunk
 	for {
 		chunk, err := loadChunk(b)
@@ -102,20 +123,25 @@ func loadChunks(b *bytes.Reader) ([]*pngChunk, error) {
 	return chunks, nil
 }
 
-func createChunk(typeString, payload []byte) (*pngChunk, error) {
+// createChunk creates a sneaky chunk for the payload
+func createChunk(typeBytes, payload []byte) (*pngChunk, error) {
 	var chunk pngChunk
-	if len(typeString) != 4 {
+	typeString := string(typeBytes)
+	if len(typeBytes) != 4 {
 		// Can we pad it if it's less than 4 bytes? Probably
 		return nil, fmt.Errorf("type string must be 4 bytes long")
+	} else if typeString[0] == strings.ToUpper(typeString)[0] {
+		return nil, fmt.Errorf("cannot use chunk type %s, leading capital letter marks it as critical", typeString)
 	}
-	chunk.chunkType = typeString
+	chunk.chunkType = typeBytes
 	chunk.data = payload
 	chunk.size = uint32(len(payload))
 	var err error
-	chunk.crc, err = calculateCrc(typeString, payload)
+	chunk.crc, err = calculateCrc(typeBytes, payload)
 	return &chunk, err
 }
 
+// chunksToPngBytes generates a byte array from a list of PNG chunks
 func chunksToPngBytes(chunks []*pngChunk) ([]byte, error) {
 	var buff bytes.Buffer
 	header := make([]byte, 8)
@@ -124,31 +150,18 @@ func chunksToPngBytes(chunks []*pngChunk) ([]byte, error) {
 		return nil, err
 	}
 	for _, chunk := range chunks {
-		if err := binary.Write(&buff, binary.BigEndian, chunk.size); err != nil {
-			return nil, fmt.Errorf("error writing chunk size to buffer: %v", err)
-		}
-		if err := binary.Write(&buff, binary.BigEndian, chunk.chunkType); err != nil {
-			return nil, fmt.Errorf("error writing chunk type '%s' to buffer: %v", string(chunk.chunkType), err)
-		}
-		if err := binary.Write(&buff, binary.BigEndian, chunk.data); err != nil {
-			return nil, fmt.Errorf("error writing chunk data to buffer: %v", err)
-		}
-		if err := binary.Write(&buff, binary.BigEndian, chunk.crc); err != nil {
-			return nil, fmt.Errorf("error writing chunk CRC to buffer: %v", err)
+		if err := chunk.marshalData(&buff); err != nil {
+			return nil, err
 		}
 	}
 
 	return buff.Bytes(), nil
 }
 
-// HidePayload Places a payload into a provided PNG file
-func HidePayload(typeString, payload []byte, pngPath string) ([]byte, error) {
-	pic, err := ioutil.ReadFile(pngPath)
-	if err != nil {
-		return nil, err
-	}
+
+func unmarshalData(pic []byte) ([]*pngChunk, error) {
 	picReader := bytes.NewReader(pic)
-	err = confirmPng(picReader)
+	err := confirmPng(picReader)
 	if err != nil {
 		return nil, err
 	}
@@ -156,15 +169,35 @@ func HidePayload(typeString, payload []byte, pngPath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return chunks, nil
+}
+
+// HidePayload Places a payload into a provided PNG file
+func HidePayload(typeString, payload, pic []byte) ([]byte, error) {
+	chunks, err := unmarshalData(pic)
+	if err != nil {
+		return nil, err
+	}
 	newChunk, err := createChunk(typeString, payload)
 	if err != nil {
 		return nil, err
 	}
-	// TODO: do something trickier here maybe?
-	chunks = append([]*pngChunk{newChunk}, chunks...)
+	// Put our chunk second to last
+	chunks = append(chunks[0:len(chunks)-1], newChunk, chunks[len(chunks)-1])
 	return chunksToPngBytes(chunks)
 }
 
-func ReturnPayload(pngPath string) ([]byte, error) {
-	return nil, nil
+func RecoverPayload(typeBytes, pic []byte) ([]byte, error) {
+	chunks, err := unmarshalData(pic)
+	if err != nil {
+		return nil, err
+	}
+	sneakyChunk := chunks[len(chunks)-2]
+	chunkType := string(sneakyChunk.chunkType)
+	typeString := string(typeBytes)
+	if chunkType != typeString {
+		return nil, fmt.Errorf(
+			"type string did not match. expected: %s, actual: %s", typeString, chunkType)
+	}
+	return sneakyChunk.data, nil
 }
